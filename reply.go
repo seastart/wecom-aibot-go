@@ -162,7 +162,14 @@ func NewMediaReply(requestID string, mediaType MessageType, mediaID string, vide
 
 // PushBody proactively sends a message to a chat.
 type PushBody struct {
-	ChatID       string               `json:"chatid"`
+	ChatID string `json:"chatid"`
+	// ChatType tells the server how to resolve ChatID (official aibot_send_msg field):
+	//   1 = single chat (ChatID must be the user's userid)
+	//   2 = group chat  (ChatID is the group chatid from group callbacks)
+	//   0 / omitted = compatible mode, but the server resolves it as GROUP first —
+	//                 so single chats MUST set 1 explicitly or addressing fails.
+	// omitempty keeps existing callers that leave it 0 byte-for-byte identical.
+	ChatType     int                  `json:"chat_type,omitempty"`
 	MsgType      MessageType          `json:"msgtype"`
 	Text         *TextMessageBody     `json:"text,omitempty"`
 	Markdown     *MarkdownMessageBody `json:"markdown,omitempty"`
