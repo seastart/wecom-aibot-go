@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strings"
 )
 
 // DownloadedFile is the result of downloading and optionally decrypting media.
@@ -27,7 +28,7 @@ func DecryptFile(encrypted []byte, aesKey string) ([]byte, error) {
 		return nil, errors.New("decrypt file: aes key is empty")
 	}
 
-	key, err := base64.StdEncoding.DecodeString(aesKey)
+	key, err := decodeBase64Lenient(aesKey)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt file: decode aes key: %w", err)
 	}
@@ -50,6 +51,24 @@ func DecryptFile(encrypted []byte, aesKey string) ([]byte, error) {
 	mode.CryptBlocks(decrypted, encrypted)
 
 	return pkcs7Unpad32(decrypted)
+}
+
+// decodeBase64Lenient decodes base64 the way Node's Buffer.from(s, "base64") does:
+// it tolerates missing padding and accepts both the standard and URL-safe alphabets.
+//
+// WeCom media aeskeys are delivered as 43-char unpadded base64 (and may use URL-safe
+// chars), which Go's strict base64.StdEncoding.DecodeString rejects (e.g. "illegal
+// base64 data at input byte 40"). Normalizing the alphabet and re-padding fixes it.
+func decodeBase64Lenient(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	// URL-safe alphabet → standard alphabet.
+	s = strings.ReplaceAll(s, "-", "+")
+	s = strings.ReplaceAll(s, "_", "/")
+	// Re-pad to a multiple of 4 so StdEncoding accepts it.
+	if m := len(s) % 4; m != 0 {
+		s += strings.Repeat("=", 4-m)
+	}
+	return base64.StdEncoding.DecodeString(s)
 }
 
 // DownloadFile downloads media and decrypts it when aesKey is provided.

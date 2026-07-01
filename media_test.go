@@ -81,3 +81,28 @@ func pkcs7PadForTest(data []byte, blockSize int) []byte {
 	out = append(out, bytes.Repeat([]byte{byte(padLen)}, padLen)...)
 	return out
 }
+
+// TestDecodeBase64Lenient 验证宽容解码：无填充、URL-safe、标准填充三种形态都能还原 32 字节 key。
+// 复现真机 bug：企微 aeskey 是 43 字符无填充 base64，严格 StdEncoding 会在 byte 40 处报错。
+func TestDecodeBase64Lenient(t *testing.T) {
+	var key [32]byte
+	for i := range key {
+		key[i] = byte(i * 7)
+	}
+	cases := map[string]string{
+		"raw-std（无填充，复现真机 43 字符）": base64.RawStdEncoding.EncodeToString(key[:]),
+		"raw-url（URL-safe 无填充）":   base64.RawURLEncoding.EncodeToString(key[:]),
+		"std（标准带填充）":              base64.StdEncoding.EncodeToString(key[:]),
+	}
+	for name, enc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := decodeBase64Lenient(enc)
+			if err != nil {
+				t.Fatalf("解码 %q 失败: %v", enc, err)
+			}
+			if !bytes.Equal(got, key[:]) {
+				t.Errorf("解码结果与原 key 不一致")
+			}
+		})
+	}
+}
