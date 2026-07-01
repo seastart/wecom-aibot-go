@@ -106,3 +106,16 @@ func TestDecodeBase64Lenient(t *testing.T) {
 		})
 	}
 }
+
+// TestFilenameFromContentDisposition_PercentDecoded 验证 percent-编码的 UTF-8 文件名被还原（真机场景）。
+func TestFilenameFromContentDisposition_PercentDecoded(t *testing.T) {
+	// 真机：Content-Disposition 里中文名按 percent-encoding 放在 filename=。
+	h := `attachment; filename="%E4%BC%81%E4%B8%9A_x.png"`
+	if got := filenameFromContentDisposition(h); got != "企业_x.png" {
+		t.Errorf("got %q，期望还原为 企业_x.png", got)
+	}
+	// 普通 ASCII 名原样返回。
+	if got := filenameFromContentDisposition(`attachment; filename="a.json"`); got != "a.json" {
+		t.Errorf("got %q，期望 a.json", got)
+	}
+}

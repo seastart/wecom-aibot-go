@@ -10,7 +10,9 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strings"
+	"unicode/utf8"
 )
 
 // DownloadedFile is the result of downloading and optionally decrypting media.
@@ -139,5 +141,12 @@ func filenameFromContentDisposition(header string) string {
 	if err != nil {
 		return ""
 	}
-	return params["filename"]
+	name := params["filename"]
+	// 企微常把 UTF-8 文件名按 percent-encoding 放进 filename=（如 "%E4%BC%81...png"）。
+	// 若能成功 percent-decode 且结果是合法 UTF-8，用解码后的名字（还原中文等非 ASCII 原名）。
+	// PathUnescape 对不含 % 的串原样返回、对非法转义返回 error（此时保留原值），故安全。
+	if decoded, derr := url.PathUnescape(name); derr == nil && utf8.ValidString(decoded) {
+		name = decoded
+	}
+	return name
 }
