@@ -35,12 +35,16 @@ type Config struct {
 }
 
 // MessageHandler handles normalized incoming messages.
+// 回调在独立 goroutine 中执行（见 dispatchFrame），返回的 error 仅供调用方
+// 自行处理，库不再据此中断连接。回调内可安全调用 SendAndWait 等待 ack。
 type MessageHandler func(ctx context.Context, msg *Message) error
 
 // EventHandler handles incoming events such as disconnect notifications.
+// 同 MessageHandler：异步执行，返回的 error 不会中断连接。
 type EventHandler func(ctx context.Context, event *Event) error
 
 // AckHandler handles server acknowledgements for subscribe/reply/push requests.
+// 仅当 ack 未被 SendAndWait 认领时才回调；异步执行，返回的 error 不会中断连接。
 type AckHandler func(ctx context.Context, ack *Ack) error
 
 // Client owns exactly one WebSocket connection for exactly one robot.
@@ -354,23 +358,35 @@ func (c *Client) dispatchFrame(ctx context.Context, data []byte) error {
 
 	switch frame.Kind {
 	case FrameKindMessage:
+		// 业务回调必须【异步】执行。读循环是唯一能 conn.ReadMessage 的 goroutine，
+		// 服务端 ack 也只能由它读出来后经 resolvePendingAck 投递。一旦回调里
+		// 同步调用 SendAndWait 等待 ack，读循环就会卡在回调内、永远读不到那条
+		// ack，直到 5s 超时——表现为「企微不回 ack」的假失败，实为自我死锁。
+		// 另起 goroutine 后读循环始终空闲，回调内的 SendAndWait 才能拿到 ack。
+		// 代价：回调并发执行、不保证先后顺序，回调返回的 error 不再中断连接
+		//（业务错误请在回调内部自行处理/记录）。
 		if c.onMessage != nil {
-			return c.onMessage(ctx, frame.Message)
+			go c.onMessage(ctx, frame.Message)
 		}
 	case FrameKindEvent:
+		// 断开控制事件决定是否停止自动重连，必须在读循环内同步处理。
 		c.handleReconnectControlEvent(frame.Event)
+		// 业务事件回调异步派发，理由同 onMessage。
 		if c.onEvent != nil {
-			return c.onEvent(ctx, frame.Event)
+			go c.onEvent(ctx, frame.Event)
 		}
 	case FrameKindAck:
+		// ack 的认领必须【同步】完成：正阻塞在 SendAndWait 的调用方等着
+		// resolvePendingAck 把结果投递回去，不能延后。
 		if c.handleHeartbeatAck(frame.Ack) {
 			return nil
 		}
 		if c.resolvePendingAck(frame.Ack) {
 			return nil
 		}
+		// 未被认领的 ack 才交给用户回调，异步执行避免阻塞读循环。
 		if c.onAck != nil {
-			return c.onAck(ctx, frame.Ack)
+			go c.onAck(ctx, frame.Ack)
 		}
 	}
 	return nil
