@@ -8,6 +8,20 @@
 - 短连接：提供 webhook handler，完成明文/加密模式下的签名校验、URL 验证、消息解析和 JSON 回复。
 - 消息结构体：显式建模文本、图片、图文混排、语音、文件、视频、引用消息字段，同时保留原始 JSON。
 
+## 安装
+
+需要 Go 1.25+。在你的项目里执行：
+
+```bash
+go get github.com/seastart/wecom-aibot-go
+```
+
+导入后包名为 `aibot`（示例统一用该别名，以便与官方 SDK 命名对齐）：
+
+```go
+import aibot "github.com/seastart/wecom-aibot-go"
+```
+
 本库的长连接帧格式已按官方 Node SDK 对齐：
 
 ```json
