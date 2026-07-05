@@ -90,7 +90,7 @@ func TestStreamReplyBuildsIncrementalPayload(t *testing.T) {
 }
 
 func TestPushMarkdownBuildsPushPayload(t *testing.T) {
-	push := NewMarkdownPush("chat-1", "**done**")
+	push := NewMarkdownPush("chat-1", ChatTypeGroup, "**done**")
 
 	data, err := json.Marshal(push)
 	if err != nil {
@@ -108,6 +108,10 @@ func TestPushMarkdownBuildsPushPayload(t *testing.T) {
 	body := got["body"].(map[string]any)
 	if body["chatid"] != "chat-1" {
 		t.Fatalf("body.chatid = %v, want chat-1", body["chatid"])
+	}
+	// chat_type 必须随包发出，否则单聊寻址会被服务端按群聊解析。
+	if body["chat_type"] != float64(ChatTypeGroup) {
+		t.Fatalf("body.chat_type = %v, want %d", body["chat_type"], ChatTypeGroup)
 	}
 }
 

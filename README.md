@@ -171,35 +171,31 @@ func main() {
 
 ## 主动推送
 
-除了"收到消息再回复"，还可以用 `aibot_send_msg` **主动**给某个会话推送消息（不依赖回调 `req_id`）。库提供了 Markdown / 模板卡片 / 媒体三种便捷构造函数，建议用 `SendAndWait` 发送以拿到企微 ACK：
+除了"收到消息再回复"，还可以用 `aibot_send_msg` **主动**给某个会话推送消息（不依赖回调 `req_id`）。库提供了 Markdown / 模板卡片 / 媒体三种便捷构造函数，第二个参数 `chatType` 为必填，建议用 `SendAndWait` 发送以拿到企微 ACK：
 
 ```go
 // 群聊推送：chatid 用群聊回调里的 chatid
-push := aibot.NewMarkdownPush(chatID, "**发布完成**\n结果：成功")
-push.Body.ChatType = 2 // 2=群聊
+push := aibot.NewMarkdownPush(chatID, aibot.ChatTypeGroup, "**发布完成**\n结果：成功")
 if _, err := client.SendAndWait(ctx, push); err != nil {
     log.Printf("push failed: %v", err)
 }
 ```
 
-> ⚠️ **`chat_type` 必须正确设置，否则单聊寻址会失败。** `chat_type` 告诉服务端如何解析 `chatid`：
-> - `1` = 单聊，此时 `chatid` 传**用户的 userid**；
-> - `2` = 群聊，此时 `chatid` 传群聊回调里的 `chatid`；
-> - `0`（不设置）= 兼容模式，但服务端会**优先按群聊解析**，所以**单聊推送必须显式设置 `push.Body.ChatType = 1`**，否则发不出去。
+> ⚠️ **`chatType` 必须正确指定，否则单聊寻址会失败。** 它告诉服务端如何解析 `chatid`：
+> - `aibot.ChatTypeSingle`（1）= 单聊，此时 `chatid` 传**用户的 userid**；
+> - `aibot.ChatTypeGroup`（2）= 群聊，此时 `chatid` 传群聊回调里的 `chatid`。
 >
-> `NewMarkdownPush` 等构造函数默认不设 `chat_type`（即 0），需要单聊时务必手动赋值。
+> 若缺省（0），服务端会**优先按群聊解析**，单聊会发不出去——所以库把 `chatType` 设计成了构造函数的必填形参，避免遗漏。
 
 模板卡片和媒体推送同理：
 
 ```go
-// 模板卡片推送
+// 模板卡片推送（单聊：chatid 传 userid）
 card := aibot.TemplateCard{ /* 官方模板卡片 JSON 结构 */ }
-cardPush := aibot.NewTemplateCardPush(chatID, card)
-cardPush.Body.ChatType = 1 // 单聊：chatid 传 userid
+cardPush := aibot.NewTemplateCardPush(userID, aibot.ChatTypeSingle, card)
 
 // 媒体推送（先 UploadMedia 拿到 media_id）
-mediaPush := aibot.NewMediaPush(chatID, aibot.MessageTypeImage, mediaID, nil)
-mediaPush.Body.ChatType = 2
+mediaPush := aibot.NewMediaPush(chatID, aibot.ChatTypeGroup, aibot.MessageTypeImage, mediaID, nil)
 
 _, _ = client.SendAndWait(ctx, cardPush)
 _, _ = client.SendAndWait(ctx, mediaPush)

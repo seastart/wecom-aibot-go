@@ -160,16 +160,23 @@ func NewMediaReply(requestID string, mediaType MessageType, mediaID string, vide
 	}
 }
 
+// ChatType tells the server how to resolve a push target's ChatID
+// (official aibot_send_msg field). 主动推送必须显式指定，否则单聊寻址会失败：
+// 服务端在 chat_type 缺省时会优先按群聊解析。
+type ChatType int
+
+const (
+	// ChatTypeSingle 单聊：ChatID 必须传用户的 userid。
+	ChatTypeSingle ChatType = 1
+	// ChatTypeGroup 群聊：ChatID 传群聊回调里的 chatid。
+	ChatTypeGroup ChatType = 2
+)
+
 // PushBody proactively sends a message to a chat.
 type PushBody struct {
 	ChatID string `json:"chatid"`
-	// ChatType tells the server how to resolve ChatID (official aibot_send_msg field):
-	//   1 = single chat (ChatID must be the user's userid)
-	//   2 = group chat  (ChatID is the group chatid from group callbacks)
-	//   0 / omitted = compatible mode, but the server resolves it as GROUP first —
-	//                 so single chats MUST set 1 explicitly or addressing fails.
-	// omitempty keeps existing callers that leave it 0 byte-for-byte identical.
-	ChatType     int                  `json:"chat_type,omitempty"`
+	// ChatType 指明 ChatID 的会话类型，见 ChatType 常量。由构造函数强制传入。
+	ChatType     ChatType             `json:"chat_type,omitempty"`
 	MsgType      MessageType          `json:"msgtype"`
 	Text         *TextMessageBody     `json:"text,omitempty"`
 	Markdown     *MarkdownMessageBody `json:"markdown,omitempty"`
@@ -188,25 +195,27 @@ type PushMessage = WsFrame[PushBody]
 // Deprecated: Node SDK and official long-connection docs describe proactive
 // send as markdown/template_card/media. Prefer NewMarkdownPush or media push
 // helpers when they are available.
-func NewTextPush(chatID, content string) PushMessage {
-	return PushMessage{
-		Cmd:     WsCmdSendMessage,
-		Headers: WsHeaders{ReqID: NewReqID(WsCmdSendMessage)},
-		Body: PushBody{
-			ChatID:  chatID,
-			MsgType: MessageTypeText,
-			Text:    &TextMessageBody{Content: content},
-		},
-	}
-}
-
-// NewMarkdownPush creates a proactive markdown push payload.
-func NewMarkdownPush(chatID, content string) PushMessage {
+func NewTextPush(chatID string, chatType ChatType, content string) PushMessage {
 	return PushMessage{
 		Cmd:     WsCmdSendMessage,
 		Headers: WsHeaders{ReqID: NewReqID(WsCmdSendMessage)},
 		Body: PushBody{
 			ChatID:   chatID,
+			ChatType: chatType,
+			MsgType:  MessageTypeText,
+			Text:     &TextMessageBody{Content: content},
+		},
+	}
+}
+
+// NewMarkdownPush creates a proactive markdown push payload.
+func NewMarkdownPush(chatID string, chatType ChatType, content string) PushMessage {
+	return PushMessage{
+		Cmd:     WsCmdSendMessage,
+		Headers: WsHeaders{ReqID: NewReqID(WsCmdSendMessage)},
+		Body: PushBody{
+			ChatID:   chatID,
+			ChatType: chatType,
 			MsgType:  MessageTypeMarkdown,
 			Markdown: &MarkdownMessageBody{Content: content},
 		},
@@ -214,12 +223,13 @@ func NewMarkdownPush(chatID, content string) PushMessage {
 }
 
 // NewTemplateCardPush proactively sends a template card.
-func NewTemplateCardPush(chatID string, card TemplateCard) PushMessage {
+func NewTemplateCardPush(chatID string, chatType ChatType, card TemplateCard) PushMessage {
 	return PushMessage{
 		Cmd:     WsCmdSendMessage,
 		Headers: WsHeaders{ReqID: NewReqID(WsCmdSendMessage)},
 		Body: PushBody{
 			ChatID:       chatID,
+			ChatType:     chatType,
 			MsgType:      MessageTypeTemplateCard,
 			TemplateCard: card,
 		},
@@ -227,8 +237,8 @@ func NewTemplateCardPush(chatID string, card TemplateCard) PushMessage {
 }
 
 // NewMediaPush proactively sends uploaded file/image/voice/video media.
-func NewMediaPush(chatID string, mediaType MessageType, mediaID string, videoOptions *VideoMessageBody) PushMessage {
-	body := PushBody{ChatID: chatID, MsgType: mediaType}
+func NewMediaPush(chatID string, chatType ChatType, mediaType MessageType, mediaID string, videoOptions *VideoMessageBody) PushMessage {
+	body := PushBody{ChatID: chatID, ChatType: chatType, MsgType: mediaType}
 	switch mediaType {
 	case MessageTypeFile:
 		body.File = &MediaMessageBody{MediaID: mediaID}
