@@ -51,6 +51,44 @@ import aibot "github.com/seastart/wecom-aibot-go"
 
 ## 长连接示例
 
+### 客户端初始化
+
+用 `aibot.NewClient` 创建客户端，注册回调，然后运行：
+
+```go
+client := aibot.NewClient(aibot.Config{
+    BotID:  "你的 BotID",  // 企业微信管理端 -> 智能机器人 获取
+    Secret: "你的 Secret", // 长连接 Secret，注意不要提交进源码
+})
+
+client.OnMessage(func(ctx context.Context, msg *aibot.Message) error { /* 收到消息 */ return nil })
+client.OnEvent(func(ctx context.Context, event *aibot.Event) error { /* 收到事件 */ return nil })
+client.OnAck(func(ctx context.Context, ack *aibot.Ack) error { /* 企微回执 */ return nil })
+
+// RunForever 会在连接断开后自动重连（指数退避，最大 30s）；
+// Run 只连接一次，断开即返回，适合自己控制重连。
+if err := client.RunForever(context.Background()); err != nil {
+    log.Fatal(err)
+}
+```
+
+`Config` 各字段（除 `BotID`/`Secret` 外均有默认值，一般无需设置）：
+
+| 字段 | 说明 | 默认值 |
+| --- | --- | --- |
+| `BotID` | 智能机器人 BotID（必填） | — |
+| `Secret` | 长连接 Secret（必填），建议从环境变量注入 | — |
+| `Endpoint` | 长连接地址，私有部署时才需覆盖 | `wss://openws.work.weixin.qq.com` |
+| `Header` | 额外的握手 HTTP Header（如代理/鉴权） | 无 |
+| `HeartbeatInterval` | 客户端心跳间隔 | 30s |
+| `ReconnectInterval` | `RunForever` 首次重连间隔（之后指数退避，封顶 30s） | 3s |
+| `ReplyAckTimeout` | `SendAndWait` 等待企微 ACK 的超时 | 5s |
+| `MaxMissedPong` | 连续丢失多少次心跳 ACK 后判定连接失效并断开重连 | 3 |
+
+> 同一个机器人同一时间只能有一个有效长连接，多实例连同一个 BotID 会互相踢下线（见文末「重要限制」）。
+
+### echo 示例
+
 仓库内置了一个可直接测试的 echo 示例：
 
 ```bash
