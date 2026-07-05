@@ -169,6 +169,86 @@ func main() {
 }
 ```
 
+## 主动推送
+
+除了"收到消息再回复"，还可以用 `aibot_send_msg` **主动**给某个会话推送消息（不依赖回调 `req_id`）。库提供了 Markdown / 模板卡片 / 媒体三种便捷构造函数，建议用 `SendAndWait` 发送以拿到企微 ACK：
+
+```go
+// 群聊推送：chatid 用群聊回调里的 chatid
+push := aibot.NewMarkdownPush(chatID, "**发布完成**\n结果：成功")
+push.Body.ChatType = 2 // 2=群聊
+if _, err := client.SendAndWait(ctx, push); err != nil {
+    log.Printf("push failed: %v", err)
+}
+```
+
+> ⚠️ **`chat_type` 必须正确设置，否则单聊寻址会失败。** `chat_type` 告诉服务端如何解析 `chatid`：
+> - `1` = 单聊，此时 `chatid` 传**用户的 userid**；
+> - `2` = 群聊，此时 `chatid` 传群聊回调里的 `chatid`；
+> - `0`（不设置）= 兼容模式，但服务端会**优先按群聊解析**，所以**单聊推送必须显式设置 `push.Body.ChatType = 1`**，否则发不出去。
+>
+> `NewMarkdownPush` 等构造函数默认不设 `chat_type`（即 0），需要单聊时务必手动赋值。
+
+模板卡片和媒体推送同理：
+
+```go
+// 模板卡片推送
+card := aibot.TemplateCard{ /* 官方模板卡片 JSON 结构 */ }
+cardPush := aibot.NewTemplateCardPush(chatID, card)
+cardPush.Body.ChatType = 1 // 单聊：chatid 传 userid
+
+// 媒体推送（先 UploadMedia 拿到 media_id）
+mediaPush := aibot.NewMediaPush(chatID, aibot.MessageTypeImage, mediaID, nil)
+mediaPush.Body.ChatType = 2
+
+_, _ = client.SendAndWait(ctx, cardPush)
+_, _ = client.SendAndWait(ctx, mediaPush)
+```
+
+> 频率限制：无论回复还是主动推送，单会话合计 **30 条/分钟、1000 条/小时**。
+
+## 事件回调
+
+除了消息回调（`aibot_msg_callback`），企业微信还会通过 `aibot_event_callback` 推送**事件**。长连接模式下共支持 4 种事件，用 `client.OnEvent` 注册处理器接收：
+
+| eventtype | 含义 | 回复要求 | 对应能力 |
+| --- | --- | --- | --- |
+| `enter_chat` | 用户当天首次进入机器人单聊会话 | 尽快回复（约 5 秒内），否则当天再次进入不再推送 | `NewWelcomeTextReply` 回欢迎语 |
+| `template_card_event` | 用户点击模板卡片的按钮/选项 | **必须 5 秒内响应**，否则连接被断开 | `NewUpdateTemplateCard` 更新卡片 |
+| `feedback_event` | 用户对回复点赞/点踩 | 仅支持回空包，不能发新消息或更新卡片 | 读取 `Feedback` 字段 |
+| `disconnected_event` | 有新连接建立，服务端主动断开旧连接 | 无需回复 | 库内部据此**停止自动重连** |
+
+> 官方文档：[事件回调](https://developer.work.weixin.qq.com/document/path/101027)、[长连接·接收事件回调](https://developer.work.weixin.qq.com/document/path/101463)
+
+事件的业务字段**嵌套在与 `eventtype` 同名的子对象里**，库已按官方 schema 建模：`template_card_event` 的详情在 `event.Event.TemplateCard`（含 `EventKey` / `TaskID` / `CardType` / `SelectedItems`），`feedback_event` 的详情在 `event.Event.Feedback`（含 `ID` / `Type` / `Content` / `InaccurateReasonList`）。
+
+```go
+client.OnEvent(func(ctx context.Context, event *aibot.Event) error {
+    if event.Event == nil {
+        return nil
+    }
+    // 回复事件同样要透传事件帧的 headers.req_id（event.ReqID），不能用 body.msgid。
+    switch event.Event.EventType {
+    case aibot.EventTypeEnterChat:
+        return client.Send(ctx, aibot.NewWelcomeTextReply(event.ReqID, "你好，有什么可以帮你？"))
+    case aibot.EventTypeTemplateCard:
+        card := event.Event.TemplateCard // 用户点了哪个按钮：card.EventKey
+        _ = card
+        return nil
+    case aibot.EventTypeFeedback:
+        fb := event.Event.Feedback // fb.Type：1=准确 2=不准确 3=取消
+        _ = fb
+        return nil
+    case aibot.EventTypeDisconnected:
+        // 连接被新实例抢占，RunForever 会停止重连，避免互相踢下线。
+        return nil
+    }
+    return nil
+})
+```
+
+> ⚠️ 收到 `disconnected_event` 说明该机器人的长连接被另一个实例抢占了（同一机器人同时只能有一个有效长连接）。此时 `RunForever` 会**故意不再重连**。如果线上出现"机器人突然不回消息"，先排查是不是有多个实例在连同一个 BotID。
+
 ## 短连接示例
 
 ```go

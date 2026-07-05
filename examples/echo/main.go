@@ -33,6 +33,36 @@ func main() {
 
 	client.OnEvent(func(ctx context.Context, event *aibot.Event) error {
 		logJSON("event", event)
+		if event.Event == nil {
+			return nil
+		}
+
+		// 事件统一走 aibot_event_callback，用 eventtype 区分。回复同样要透传
+		// 事件帧的 headers.req_id（event.ReqID），不能用 body.msgid。
+		switch event.Event.EventType {
+		case aibot.EventTypeEnterChat:
+			// 用户当天首次进入单聊，回一句欢迎语。需尽快回复（约 5 秒内），
+			// 否则当天再次进入不会再推送该事件。
+			return client.Send(ctx, aibot.NewWelcomeTextReply(event.ReqID, "你好，我是机器人，有什么可以帮你？"))
+		case aibot.EventTypeTemplateCard:
+			// 用户点击了模板卡片按钮/选项，event_key 指明点了哪个按钮。
+			// 该事件需在 5 秒内响应，否则连接会被断开。
+			if card := event.Event.TemplateCard; card != nil {
+				log.Printf("template card clicked: event_key=%s task_id=%s", card.EventKey, card.TaskID)
+			}
+			return nil
+		case aibot.EventTypeFeedback:
+			// 用户对回复点赞/点踩。反馈事件只支持回空包，不能再发新消息或更新卡片。
+			if fb := event.Event.Feedback; fb != nil {
+				log.Printf("feedback: id=%s type=%d content=%q", fb.ID, fb.Type, fb.Content)
+			}
+			return nil
+		case aibot.EventTypeDisconnected:
+			// 有新连接抢占了这个机器人，服务端主动断开当前旧连接。
+			// 库内部据此停止自动重连（避免和新连接互相踢下线）。
+			log.Printf("connection replaced by a newer one, will stop reconnecting")
+			return nil
+		}
 		return nil
 	})
 

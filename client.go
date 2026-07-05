@@ -391,7 +391,7 @@ func (c *Client) reconnectDelay(attempt int) time.Duration {
 }
 
 func (c *Client) handleReconnectControlEvent(event *Event) {
-	if event == nil || event.Event == nil || event.Event.EventType != "disconnected_event" {
+	if event == nil || event.Event == nil || event.Event.EventType != EventTypeDisconnected {
 		return
 	}
 	c.mu.Lock()

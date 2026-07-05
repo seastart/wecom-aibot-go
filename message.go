@@ -23,6 +23,21 @@ const (
 	MessageTypeTemplateCard MessageType = "template_card"
 )
 
+// 事件类型（eventtype），统一通过 aibot_event_callback 下发。
+// 未知取值会原样保留在 EventContent.EventType 里，方便调用方在库支持新事件前
+// 自行处理。参考官方文档：事件回调 https://developer.work.weixin.qq.com/document/path/101027
+const (
+	// EventTypeEnterChat 用户当天首次进入机器人单聊会话，可回复欢迎语。
+	EventTypeEnterChat = "enter_chat"
+	// EventTypeTemplateCard 用户点击模板卡片的按钮/选项，需在 5 秒内响应，否则连接断开。
+	EventTypeTemplateCard = "template_card_event"
+	// EventTypeFeedback 用户对机器人回复做出点赞/点踩反馈，仅支持回复空包。
+	EventTypeFeedback = "feedback_event"
+	// EventTypeDisconnected 有新连接建立时，服务端向旧连接推送此事件并主动断开。
+	// 属于长连接控制事件（见长连接文档 101463），收到后不应继续重连。
+	EventTypeDisconnected = "disconnected_event"
+)
+
 // FrameKind describes the high-level payload pushed by the long connection.
 type FrameKind string
 
@@ -134,10 +149,60 @@ type Event struct {
 }
 
 // EventContent carries the concrete event name and protocol-specific fields.
+// 不同事件的业务字段分别嵌套在与 eventtype 同名的子对象里（官方文档 101027），
+// 例如 template_card_event 的内容在 event.template_card_event 下，而不是与
+// eventtype 平级，所以这里用独立的子结构体建模，不能把字段直接挂在本结构上。
 type EventContent struct {
-	EventType string          `json:"eventtype,omitempty"`
-	TaskID    string          `json:"task_id,omitempty"`
-	Raw       json.RawMessage `json:"-"`
+	// EventType 事件类型，取值见 EventType* 常量；未知取值原样保留。
+	EventType string `json:"eventtype,omitempty"`
+	// TemplateCard 模板卡片交互详情，仅 eventtype=template_card_event 时存在。
+	TemplateCard *TemplateCardEvent `json:"template_card_event,omitempty"`
+	// Feedback 用户反馈详情，仅 eventtype=feedback_event 时存在。
+	Feedback *FeedbackEvent  `json:"feedback_event,omitempty"`
+	Raw      json.RawMessage `json:"-"`
+}
+
+// TemplateCardEvent 是用户点击模板卡片按钮/选项后回调的事件详情。
+type TemplateCardEvent struct {
+	// CardType 卡片类型：button_interaction / vote_interaction /
+	// multiple_interaction / text_notice / news_notice。
+	CardType string `json:"card_type,omitempty"`
+	// EventKey 用户点击的按钮 key，对应下发卡片时设置的 key。
+	EventKey string `json:"event_key,omitempty"`
+	// TaskID 交互卡片的 task_id，更新卡片时需回传相同值。
+	TaskID string `json:"task_id,omitempty"`
+	// SelectedItems 投票/多选类卡片的用户选择结果，普通按钮卡片不返回。
+	SelectedItems *SelectedItems `json:"selected_items,omitempty"`
+}
+
+// SelectedItems 保留企业微信 XML 转 JSON 后的双层嵌套：selected_items.selected_item[]。
+type SelectedItems struct {
+	SelectedItem []SelectedItem `json:"selected_item,omitempty"`
+}
+
+// SelectedItem 是一道题的选择结果。
+type SelectedItem struct {
+	// QuestionKey 题目 key。
+	QuestionKey string `json:"question_key,omitempty"`
+	// OptionIDs 用户选中的选项 id，同样是双层嵌套：option_ids.option_id[]。
+	OptionIDs *OptionIDs `json:"option_ids,omitempty"`
+}
+
+// OptionIDs 保留 option_id 数组外层的包裹结构。
+type OptionIDs struct {
+	OptionID []string `json:"option_id,omitempty"`
+}
+
+// FeedbackEvent 是用户对机器人回复做出反馈时的事件详情。
+type FeedbackEvent struct {
+	// ID 反馈 id，对应回复消息时设置的 stream.feedback.id。
+	ID string `json:"id,omitempty"`
+	// Type 反馈类型：1=准确（点赞），2=不准确（点踩），3=取消反馈。
+	Type int `json:"type,omitempty"`
+	// Content 用户填写的反馈内容，仅 type=2（不准确）时返回。
+	Content string `json:"content,omitempty"`
+	// InaccurateReasonList 负反馈原因编号列表，仅 type=2 时返回。
+	InaccurateReasonList []int `json:"inaccurate_reason_list,omitempty"`
 }
 
 // Ack is returned by WeCom for client-side requests such as subscribe/reply.
