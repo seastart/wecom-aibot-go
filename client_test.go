@@ -36,6 +36,10 @@ func TestClientSubscribesAndDispatchesMessage(t *testing.T) {
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"cmd":"aibot_msg_callback","headers":{"req_id":"req-1"},"body":{"msgtype":"text","msgid":"msg-1","text":{"content":"hello"}}}`)); err != nil {
 			t.Errorf("WriteMessage returned error: %v", err)
 		}
+		// 写完消息后【保持连接】直到客户端断开（测试结束 ctx 取消）。回调已改异步派发，
+		// 若在此处立刻 defer Close 关连接，读循环会先读到 close 1006 让 Run 提前返回，
+		// 与异步回调投递 receivedMessage 形成竞态。阻塞读一次把连接留住即可消除竞态。
+		_, _, _ = conn.ReadMessage()
 	}))
 	defer server.Close()
 
@@ -386,6 +390,70 @@ func TestClientRunForeverReconnectsAfterConnectionClose(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatalf("timeout waiting for connection %d", i+1)
 		}
+	}
+}
+
+// TestClientRunForeverStopsWithErrServerDisconnected 验证：服务端下发 disconnected_event
+// （新连接顶替旧连接）后，RunForever【停止重连】且返回可被 errors.Is 识别的
+// ErrServerDisconnected——把「被顶替」这一真实原因暴露给调用方，而非埋在随后的 socket 关闭错误里。
+func TestClientRunForeverStopsWithErrServerDisconnected(t *testing.T) {
+	connections := make(chan struct{}, 4)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade returned error: %v", err)
+			return
+		}
+		defer conn.Close()
+		connections <- struct{}{}
+
+		// 先吃掉订阅帧，再下发 disconnected_event 并关闭连接（模拟服务端「被新连接顶替」踢旧连接）。
+		var sub WsFrame[SubscribeBody]
+		if err := conn.ReadJSON(&sub); err != nil {
+			t.Errorf("ReadJSON subscribe returned error: %v", err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"evt-1"},"body":{"event":{"eventtype":"disconnected_event"}}}`)); err != nil {
+			t.Errorf("WriteMessage disconnected_event returned error: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client := NewClient(Config{
+		BotID:             "bot-1",
+		Secret:            "secret-1",
+		Endpoint:          wsURL,
+		HeartbeatInterval: time.Hour,
+		ReconnectInterval: 10 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.RunForever(ctx)
+	}()
+
+	select {
+	case err := <-errCh:
+		// 关键断言 1：返回可被识别的哨兵错误（不是 ctx.Canceled，也不是被吞掉的裸网络错误）。
+		if !errors.Is(err, ErrServerDisconnected) {
+			t.Fatalf("RunForever err = %v, want errors.Is ErrServerDisconnected", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timeout: RunForever 未在收到 disconnected_event 后返回（可能仍在重连）")
+	}
+
+	// 关键断言 2：收到 disconnected_event 后不再发起新连接（stopReconnect 生效）。
+	<-connections // 第一条连接
+	select {
+	case <-connections:
+		t.Fatalf("收到 disconnected_event 后仍发起了重连，stopReconnect 未生效")
+	case <-time.After(50 * time.Millisecond):
+		// 一个重连间隔（10ms）过去仍无新连接，符合预期。
 	}
 }
 

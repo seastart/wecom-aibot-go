@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -117,7 +118,24 @@ func (c *Client) OnAck(handler AckHandler) {
 	c.onAck = handler
 }
 
+// ErrServerDisconnected 表示 RunForever 因服务端主动下发 disconnected_event 而停止重连。
+//
+// 第一性原理：企微限制「同一机器人同一时刻只能有一条有效长连接」，当有【新连接】用同一 BotID
+// 建立时，服务端会向【旧连接】推送 disconnected_event 并断开它（见 message.go 的
+// EventTypeDisconnected 说明）。这属于「被顶替」，库据此关闭自动重连——否则旧连接会不停重连、
+// 与新连接互相踢下线。
+//
+// 用途：RunForever 返回的错误可用 errors.Is(err, ErrServerDisconnected) 判定。为 true 时应理解为
+// 「别处已用同一 BotID 建了连接」，通常【不应】立即重连；为 false 时（RunForever 只在 ctx 取消时
+// 才有其它非重连返回）则是正常关停。底层那条 "use of closed network connection" 只是断开后的
+// 表象错误，会作为 %v 附在本哨兵错误之后，仅供排查参考。
+var ErrServerDisconnected = errors.New("wecom aibot: server pushed disconnected_event (a new connection took over this bot)")
+
 // RunForever keeps the long connection alive until ctx is cancelled.
+//
+// 它在一次 Run 断开后按指数退避自动重连；仅在两种情况退出：ctx 取消（返回 ctx.Err()），
+// 或服务端下发 disconnected_event 令其停止重连（返回被 ErrServerDisconnected 包裹的错误，
+// 详见该哨兵错误说明）。
 func (c *Client) RunForever(ctx context.Context) error {
 	attempt := 0
 	for {
@@ -134,7 +152,16 @@ func (c *Client) RunForever(ctx context.Context) error {
 		stopReconnect := c.stopReconnect
 		c.mu.RUnlock()
 		if stopReconnect {
-			return err
+			// 走到这里【只有一种可能】：服务端下发了 disconnected_event，
+			// handleReconnectControlEvent 把 stopReconnect 置了 true（全库仅此一处置位）。
+			// 此时 err 通常是随后 socket 被关导致的 "use of closed network connection"——
+			// 那只是【表象】，真正原因是「本连接被新连接顶替」。故在这里把真实原因用哨兵
+			// 错误 ErrServerDisconnected 显式包裹暴露给调用方，让其能 errors.Is 区分
+			// 「被顶替（不该盲目重连去互相踢）」与普通故障，而不必去猜那条网络错误的含义。
+			if err != nil {
+				return fmt.Errorf("%w: %v", ErrServerDisconnected, err)
+			}
+			return ErrServerDisconnected
 		}
 
 		attempt++
