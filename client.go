@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,6 +34,12 @@ type Config struct {
 	ReplyAckTimeout time.Duration
 	// MaxMissedPong closes the connection after this many missed heartbeat ACKs.
 	MaxMissedPong int
+	// Logger 注入调用方的结构化日志器；为 nil 时库【完全静默】（内部回退到 slog.DiscardHandler）。
+	//
+	// 第一性原理：库是纯机制层，「打不打日志、打到哪、什么级别」是调用方的策略——库不应擅自写
+	// 全局 slog.Default() 去污染每个使用方（本库被 vinez 与 zm-deploy 共用）。调用方需要可观测性
+	// 时注入自己的 logger，不需要时零配置即零噪音，两个消费方互不影响。
+	Logger *slog.Logger
 }
 
 // MessageHandler handles normalized incoming messages.
@@ -48,6 +55,38 @@ type EventHandler func(ctx context.Context, event *Event) error
 // 仅当 ack 未被 SendAndWait 认领时才回调；异步执行，返回的 error 不会中断连接。
 type AckHandler func(ctx context.Context, ack *Ack) error
 
+// ConnState 是长连接的生命周期【边沿态】——只在「真正连上」与「掉线」两个跃迁点各触发一次。
+//
+// 第一性原理：断线重连是高频内部事件（拨号失败/退避/重试可能每几十秒一轮），若把每次重试都
+// 抛给调用方会刷屏且无信息量。调用方真正关心的只是「现在到底能不能收发」这一【状态跃迁】，
+// 故只保留两个边沿态、中间的重连过程仅落库内 DEBUG 日志。
+type ConnState int
+
+const (
+	// StateDisconnected 长连接掉线（曾经连上、现在断了）。回调 err 携带断因。
+	StateDisconnected ConnState = iota
+	// StateConnected 长连接已建立【且订阅经服务端 ACK 确认】——此刻才真正能收消息。
+	StateConnected
+)
+
+// String 返回边沿态的可读名，便于日志。
+func (s ConnState) String() string {
+	switch s {
+	case StateConnected:
+		return "connected"
+	case StateDisconnected:
+		return "disconnected"
+	default:
+		return fmt.Sprintf("ConnState(%d)", int(s))
+	}
+}
+
+// ConnStateHandler 连接生命周期回调；err 仅在 StateDisconnected 时有意义（携带断因）。
+//
+// 契约：回调【同步】在库的运行 goroutine 上调用（边沿态低频，无需异步），故实现【必须尽快返回、
+// 不得阻塞】——阻塞会拖住重连。典型用法是记一行日志 / 更新一个原子状态，不要在里面做 I/O 等待。
+type ConnStateHandler func(state ConnState, err error)
+
 // Client owns exactly one WebSocket connection for exactly one robot.
 // WeCom only allows one active long connection per robot, so the library keeps
 // this type intentionally single-connection instead of hiding a connection pool.
@@ -60,12 +99,16 @@ type Client struct {
 	replyQueues     map[string]chan *queuedReply
 	missedPongCount int
 	stopReconnect   bool
+	// connected 记录「上一次向调用方广播的连接状态」，用于把重连过程去抖成 Connected/Disconnected
+	// 两个真边沿：仅当此值发生翻转时才触发回调（见 transitionConn），避免退避重试期间反复误报。
+	connected bool
 
 	writeMu sync.Mutex
 
-	onMessage MessageHandler
-	onEvent   EventHandler
-	onAck     AckHandler
+	onMessage   MessageHandler
+	onEvent     EventHandler
+	onAck       AckHandler
+	onConnState ConnStateHandler
 }
 
 type queuedReply struct {
@@ -96,6 +139,10 @@ func NewClient(cfg Config) *Client {
 	if cfg.MaxMissedPong <= 0 {
 		cfg.MaxMissedPong = 3
 	}
+	if cfg.Logger == nil {
+		// 一次性把 nil 解析成「丢弃日志器」，运行期各处直接用 cfg.Logger、无需处处判空。
+		cfg.Logger = slog.New(slog.DiscardHandler)
+	}
 	return &Client{
 		cfg:         cfg,
 		pendingAcks: make(map[string]chan Ack),
@@ -116,6 +163,38 @@ func (c *Client) OnEvent(handler EventHandler) {
 // OnAck registers the acknowledgement callback.
 func (c *Client) OnAck(handler AckHandler) {
 	c.onAck = handler
+}
+
+// OnConnectionState 注册连接生命周期回调（见 ConnStateHandler 契约）。应在 Run/RunForever 之前调用。
+func (c *Client) OnConnectionState(handler ConnStateHandler) {
+	c.onConnState = handler
+}
+
+// transitionConn 把「原始的连上/断开事件」去抖成【真边沿】后广播给调用方并落库内日志。
+//
+// 第一性原理：只有当状态相对上一次广播【真的翻转】时才通知——这样退避重连期间连续多次拨号失败
+// 只会在「首次从 connected 掉下来」时报一次 Disconnected，之后保持静默，直到真的重新连上才报
+// Connected。首次启动就连不上（从未 connected）时不会误报 Disconnected（由后续看门狗负责，不在本层）。
+func (c *Client) transitionConn(connected bool, cause error) {
+	c.mu.Lock()
+	changed := c.connected != connected
+	c.connected = connected
+	c.mu.Unlock()
+	if !changed {
+		return
+	}
+	if connected {
+		c.cfg.Logger.Info("wecom 长连接已建立并订阅成功")
+	} else {
+		c.cfg.Logger.Warn("wecom 长连接断开", "err", cause)
+	}
+	if c.onConnState != nil {
+		state := StateDisconnected
+		if connected {
+			state = StateConnected
+		}
+		c.onConnState(state, cause)
+	}
 }
 
 // ErrServerDisconnected 表示 RunForever 因服务端主动下发 disconnected_event 而停止重连。
@@ -148,6 +227,7 @@ func (c *Client) RunForever(ctx context.Context) error {
 			return ctx.Err()
 		}
 
+		// 掉线的 Disconnected 边沿已由 Run 的 defer 广播（Run 独占单条连接的完整生命周期），此处不再重复。
 		c.mu.RLock()
 		stopReconnect := c.stopReconnect
 		c.mu.RUnlock()
@@ -158,6 +238,7 @@ func (c *Client) RunForever(ctx context.Context) error {
 			// 那只是【表象】，真正原因是「本连接被新连接顶替」。故在这里把真实原因用哨兵
 			// 错误 ErrServerDisconnected 显式包裹暴露给调用方，让其能 errors.Is 区分
 			// 「被顶替（不该盲目重连去互相踢）」与普通故障，而不必去猜那条网络错误的含义。
+			c.cfg.Logger.Error("wecom 长连接被同 BotID 的新连接顶替，停止重连", "err", err)
 			if err != nil {
 				return fmt.Errorf("%w: %v", ErrServerDisconnected, err)
 			}
@@ -166,6 +247,8 @@ func (c *Client) RunForever(ctx context.Context) error {
 
 		attempt++
 		delay := c.reconnectDelay(attempt)
+		// 重连过程只落 DEBUG（高频、无状态跃迁），避免刷屏；真正的边沿由 transitionConn 报。
+		c.cfg.Logger.Debug("wecom 等待重连", "attempt", attempt, "delay", delay.String())
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
@@ -174,8 +257,13 @@ func (c *Client) RunForever(ctx context.Context) error {
 	}
 }
 
-// Run connects, subscribes, starts heartbeat, and dispatches incoming frames.
-func (c *Client) Run(ctx context.Context) error {
+// Run connects, subscribes (awaiting the server ACK), starts heartbeat, and dispatches incoming frames.
+//
+// 与旧版的关键差异（订阅要等 ACK）：订阅从「发了就不管」升级为【等服务端 ACK 且 errcode==0】才算连上——
+// 这样才能识破「socket 连上、订阅帧发了、心跳也通，但服务端没真正把订阅绑上」的僵尸假活（真机事故根因）。
+// 为此读循环必须【先于】等 ACK 启动：ACK 只能由读循环读出并经 resolvePendingAck 投递，若在读循环起来前
+// 同步等 ACK 会自锁死锁（同 dispatchFrame 注释所述）。
+func (c *Client) Run(ctx context.Context) (retErr error) {
 	if c.cfg.BotID == "" || c.cfg.Secret == "" {
 		return errors.New("wecom aibot: BotID and Secret are required")
 	}
@@ -185,6 +273,15 @@ func (c *Client) Run(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
+
+	// 一条连接的【完整生命周期】都由 Run 拥有：连上（订阅 ACK 确认）广播 Connected，退出时广播
+	// Disconnected（带断因）。放在 defer 里统一覆盖所有返回路径；transitionConn 的边沿去抖保证
+	// 「从未连上就失败」的路径不会误报 Disconnected。ctx 取消属【优雅关停】、非故障，不广播。
+	defer func() {
+		if ctx.Err() == nil {
+			c.transitionConn(false, retErr)
+		}
+	}()
 
 	c.mu.Lock()
 	c.conn = conn
@@ -206,16 +303,63 @@ func (c *Client) Run(ctx context.Context) error {
 		c.mu.Unlock()
 	}()
 
-	// 订阅是长连接握手后的第一条业务消息；只有订阅成功后，
-	// 企业微信才会把该机器人对应的消息和事件推到这条连接上。
-	if err := c.Send(ctx, NewSubscribeRequest(c.cfg.BotID, c.cfg.Secret)); err != nil {
-		return err
-	}
-
 	heartbeatDone := make(chan struct{})
 	go c.heartbeatLoop(ctx, heartbeatDone)
 	defer close(heartbeatDone)
 
+	// 读循环先起（独立 goroutine），成为这条连接【唯一】的 reader；它读到的 ack 经 resolvePendingAck
+	// 投递给正在等待的 SendAndWait（含下面的订阅）。终止错误经 readErr 回传（缓冲 1，Run 提前返回也不泄漏）。
+	readErr := make(chan error, 1)
+	go func() {
+		readErr <- c.readLoop(ctx, conn)
+	}()
+
+	// 订阅并【等服务端 ACK】。超时复用 ReplyAckTimeout（与其它 SendAndWait 同语义：等一次服务端应答）。
+	subCtx, subCancel := context.WithTimeout(ctx, c.cfg.ReplyAckTimeout)
+	defer subCancel()
+	subResult := make(chan error, 1)
+	go func() {
+		_, err := c.SendAndWait(subCtx, NewSubscribeRequest(c.cfg.BotID, c.cfg.Secret))
+		subResult <- err
+	}()
+
+	// 同时等「订阅结果」与「读循环终止」两者之一：
+	//   - 订阅先回：errcode!=0/超时 → 当作连接不可用返回（RunForever 会重连）；成功 → 广播 Connected。
+	//   - 读循环先终止：多半是【订阅 ACK 还没来连接就被顶替/断开】——直接按断开处理，否则会傻等订阅
+	//     ACK 到 subCtx 超时，把「被顶替」误报成超时（顶替检测测试正覆盖此路径）。
+	select {
+	case err := <-subResult:
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("wecom aibot: subscribe failed: %w", err)
+		}
+	case err := <-readErr:
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			return err
+		}
+		return errors.New("wecom aibot: connection closed before subscribe ack")
+	}
+
+	// 订阅经服务端确认 → 连接【真正可用】，广播 Connected 边沿。
+	c.transitionConn(true, nil)
+
+	// 稳态：阻塞直到读循环因网络错/心跳失联/ctx 取消而终止。
+	err = <-readErr
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+// readLoop 是这条连接的唯一读者：循环读帧并派发，直到出错或 ctx 取消。抽成独立函数，是为了让订阅
+// 能在它运行期间等到服务端 ACK（见 Run 的说明），避免「等 ACK 的 goroutine 与读 ACK 的 goroutine
+// 同为一个」造成的自锁死锁。
+func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 	for {
 		select {
 		case <-ctx.Done():

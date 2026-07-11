@@ -457,6 +457,138 @@ func TestClientRunForeverStopsWithErrServerDisconnected(t *testing.T) {
 	}
 }
 
+// TestClientConnectionStateConnectedThenDisconnected 验证连接生命周期回调的两个真边沿：
+// 订阅经服务端 ACK → Connected；随后服务端关连接 → Disconnected（携带断因）。
+func TestClientConnectionStateConnectedThenDisconnected(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade returned error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		var sub WsFrame[SubscribeBody]
+		if err := conn.ReadJSON(&sub); err != nil {
+			t.Errorf("ReadJSON subscribe returned error: %v", err)
+			return
+		}
+		// 回订阅 ACK（echo req_id、errcode=0）——此刻客户端才认定「真正连上」。
+		if err := conn.WriteJSON(WsFrame[struct{}]{
+			Headers: WsHeaders{ReqID: sub.Headers.ReqID},
+			ErrCode: intPtr(0),
+			ErrMsg:  "ok",
+		}); err != nil {
+			t.Errorf("WriteJSON subscribe ack returned error: %v", err)
+			return
+		}
+		<-release // 收到信号后关连接，模拟掉线，触发客户端 Disconnected。
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client := NewClient(Config{
+		BotID:             "bot-1",
+		Secret:            "secret-1",
+		Endpoint:          wsURL,
+		HeartbeatInterval: time.Hour,
+		ReplyAckTimeout:   time.Second,
+	})
+
+	type stateEvent struct {
+		state ConnState
+		err   error
+	}
+	events := make(chan stateEvent, 4)
+	client.OnConnectionState(func(state ConnState, err error) {
+		events <- stateEvent{state, err}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = client.Run(ctx) }()
+
+	select {
+	case ev := <-events:
+		if ev.state != StateConnected {
+			t.Fatalf("first event = %v, want connected", ev.state)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timeout waiting for connected")
+	}
+
+	close(release) // 服务端关连接
+	select {
+	case ev := <-events:
+		if ev.state != StateDisconnected {
+			t.Fatalf("second event = %v, want disconnected", ev.state)
+		}
+		if ev.err == nil {
+			t.Fatalf("disconnected 事件应携带断因 err，实得 nil")
+		}
+	case <-ctx.Done():
+		t.Fatalf("timeout waiting for disconnected")
+	}
+}
+
+// TestClientRunFailsWhenSubscribeAckTimesOut 验证「僵尸假活」被识破：socket 连上、订阅帧发出，但
+// 服务端【不回订阅 ACK】——Run 必须在 ReplyAckTimeout 后带 subscribe 失败错误返回，且【绝不误报 Connected】。
+// 这正是真机事故的根因场景（旧版发了订阅就当连上，永远收不到消息却一直「看着活着」）。
+func TestClientRunFailsWhenSubscribeAckTimesOut(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade returned error: %v", err)
+			return
+		}
+		defer conn.Close()
+		// 读掉订阅帧但【故意不回 ACK】，保持连接开着，让客户端一直等 ACK 直到超时。
+		var sub WsFrame[SubscribeBody]
+		_ = conn.ReadJSON(&sub)
+		<-time.After(time.Second)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client := NewClient(Config{
+		BotID:             "bot-1",
+		Secret:            "secret-1",
+		Endpoint:          wsURL,
+		HeartbeatInterval: time.Hour,
+		ReplyAckTimeout:   100 * time.Millisecond,
+	})
+
+	connectedFired := make(chan struct{}, 1)
+	client.OnConnectionState(func(state ConnState, err error) {
+		if state == StateConnected {
+			connectedFired <- struct{}{}
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- client.Run(ctx) }()
+
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "subscribe") {
+			t.Fatalf("Run err = %v, want subscribe failure", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timeout: Run 未在订阅 ACK 超时后返回")
+	}
+	// 僵尸态从未真正连上 → 绝不能误报 Connected。
+	select {
+	case <-connectedFired:
+		t.Fatalf("subscribe 未被 ACK 却误报了 Connected")
+	default:
+	}
+}
+
 func intPtr(v int) *int {
 	return &v
 }
