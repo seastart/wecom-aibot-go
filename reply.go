@@ -26,6 +26,8 @@ type TextMessageBody struct {
 // MarkdownMessageBody is reused by reply and push payloads.
 type MarkdownMessageBody struct {
 	Content string `json:"content"`
+	// Feedback 可选反馈信息，非空时该消息带反馈按钮（主动回复的 markdown 支持）。见 WithFeedback。
+	Feedback *Feedback `json:"feedback,omitempty"`
 }
 
 // ReplyBody replies to a message received from the robot long connection.
@@ -50,12 +52,18 @@ type ReplyMessage = WsFrame[ReplyBody]
 // many optional layouts. Callers can pass the official JSON shape directly.
 type TemplateCard map[string]any
 
-// StreamFeedback 挂在流式回复上的反馈信息（对应官方 stream.feedback）。
-// 设置后企微会给这条回复渲染「准确/不准确」反馈按钮，用户点击后触发 feedback_event
-// 回调（详情见 FeedbackEvent），可用于复盘机器人回复效果。
-type StreamFeedback struct {
-	// ID 反馈 id，回调 feedback_event.id 会原样带回。有效长度 256 字节以内，须 utf-8。
-	// 约束（官方）：只在「流式消息首次回复」时设置有效——即多帧流式回复应挂在首帧上。
+// Feedback 是一条回复的反馈信息（对应官方各回复场景里的 feedback 对象）。
+//
+// 第一性原理：feedback 不是某个 msgtype 的专属字段，而是「可附着在一条回复上」的横切属性——
+// stream / template_card / stream_with_template_card / update_template_card 四种回复场景都支持，
+// 分别挂在 stream.feedback 与/或 template_card.feedback 下。故这里建成一个共享类型，
+// 用包级 WithFeedback 统一挂载，而非给每个 msgtype 造一个 XxxWithFeedback 构造函数。
+//
+// 设置后企微会给这条回复渲染「准确/不准确」按钮，用户点击触发 feedback_event 回调
+// （详情见 FeedbackEvent），回调的 feedback_event.id 会原样带回这里设置的 ID，可用于复盘回复效果。
+type Feedback struct {
+	// ID 反馈 id，回调 feedback_event.id 原样带回。有效长度 256 字节以内，须 utf-8。
+	// 约束（官方）：只在「流式消息首次回复」时设置有效——多帧流式回复应挂在首帧上。
 	ID string `json:"id"`
 }
 
@@ -64,8 +72,8 @@ type StreamMessageBody struct {
 	ID      string `json:"id"`
 	Finish  bool   `json:"finish,omitempty"`
 	Content string `json:"content,omitempty"`
-	// Feedback 可选反馈信息，非空时该回复会带反馈按钮。见 StreamFeedback。
-	Feedback *StreamFeedback `json:"feedback,omitempty"`
+	// Feedback 可选反馈信息，非空时该回复带反馈按钮。一般用 WithFeedback 挂载，见其说明。
+	Feedback *Feedback `json:"feedback,omitempty"`
 }
 
 // NewStreamReply creates a stream reply. requestID must come from
@@ -85,17 +93,59 @@ func NewStreamReply(requestID, streamID, content string, finish bool) ReplyMessa
 	}
 }
 
-// NewStreamReplyWithFeedback 与 NewStreamReply 相同，但额外挂上反馈 id，让这条回复带
-// 「准确/不准确」按钮。feedbackID 为空时等价于 NewStreamReply（不挂反馈）。
-//
-// 官方约束：反馈只在「流式消息首次回复」时设置有效，故多帧流式回复应把反馈挂在首帧
-// （finish=false 的占位帧），后续覆盖帧无需重复设置。
-func NewStreamReplyWithFeedback(requestID, streamID, content, feedbackID string, finish bool) ReplyMessage {
-	reply := NewStreamReply(requestID, streamID, content, finish)
-	if feedbackID != "" {
-		reply.Body.Stream.Feedback = &StreamFeedback{ID: feedbackID}
+// feedbackBody 由 ReplyBody / PushBody 的指针实现（见各自 attachFeedback），
+// 让 WithFeedback 用同一个入口同时覆盖【被动回复】(aibot_respond_msg) 与【主动回复/推送】
+// (aibot_send_msg)——反馈是横切属性，两种下发路径都支持，不该各写一份。
+type feedbackBody interface {
+	attachFeedback(fb *Feedback)
+}
+
+// attachFeedback 把反馈挂到 body 内所有支持反馈的子消息上。官方支持反馈的 body 为
+// stream / markdown / template_card；这里对存在的接入点逐一挂载，其余忽略。
+func (b *ReplyBody) attachFeedback(fb *Feedback) {
+	if b.Stream != nil {
+		b.Stream.Feedback = fb
 	}
-	return reply
+	if b.Markdown != nil {
+		b.Markdown.Feedback = fb
+	}
+	if b.TemplateCard != nil {
+		// TemplateCard 是 loose map（官方卡片布局多变），按 map 键写入，marshal 出 {"feedback":{"id":...}}。
+		b.TemplateCard["feedback"] = *fb
+	}
+}
+
+func (b *PushBody) attachFeedback(fb *Feedback) {
+	if b.Markdown != nil {
+		b.Markdown.Feedback = fb
+	}
+	if b.TemplateCard != nil {
+		b.TemplateCard["feedback"] = *fb
+	}
+}
+
+// WithFeedback 给一条下发消息挂上反馈 id，使其渲染「准确/不准确」按钮，用户反馈时触发 feedback_event
+// 回调（feedback_event.id 原样带回此 id）。id 为空则原样返回（不挂反馈）。
+//
+// 第一性原理：反馈不属于某个 msgtype，也不分被动/主动——它是「附着在一条消息上」的横切属性。
+// 故本函数用泛型统一接收【被动回复帧】ReplyMessage 与【主动推送帧】PushMessage，把 feedback 挂到
+// 该帧实际携带的子 body 上（stream / markdown / template_card），无需为每种消息类型各造一个构造函数。
+//
+// 官方约束：反馈只在「流式消息首次回复」时设置有效，故多帧流式回复请在首帧
+// （finish=false 的占位帧）调用本函数，后续覆盖帧无需再挂。
+//
+// 典型用法：
+//
+//	aibot.WithFeedback(aibot.NewStreamReply(reqID, sid, "vinezing...", false), feedbackID) // 被动流式回复
+//	aibot.WithFeedback(aibot.NewMarkdownPush(chatID, ct, "**完成**"), feedbackID)          // 主动 markdown 推送
+func WithFeedback[B any, PB interface {
+	*B
+	feedbackBody
+}](frame WsFrame[B], id string) WsFrame[B] {
+	if id != "" {
+		PB(&frame.Body).attachFeedback(&Feedback{ID: id})
+	}
+	return frame
 }
 
 // NewTextReply creates a one-shot stream reply for ordinary text content.

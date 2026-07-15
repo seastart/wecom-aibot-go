@@ -163,13 +163,21 @@ _ = err
 
 `SendAndWait` 会按 `headers.req_id` 串行发送并等待企微 ACK，适合流式多段回复。
 
-带反馈按钮的回复（收 `feedback_event` 的发送侧）：
+带反馈按钮的消息（收 `feedback_event` 的发送侧）：
+
+反馈不属于某个 `msgtype`，也不分被动/主动——它是「附着在一条消息上」的横切属性。用 `WithFeedback`
+统一挂载，它对**被动回复**（`aibot_respond_msg`）与**主动回复/推送**（`aibot_send_msg`）两种帧一视同仁，
+把反馈挂到该帧实际携带的子 body 上（官方支持 `stream` / `markdown` / `template_card`）。
 
 ```go
-// feedbackID 会被回调 feedback_event.id 原样带回，用于把「用户点赞/点踩」关联回这条回复。
+// feedbackID 会被回调 feedback_event.id 原样带回，用于把「用户点赞/点踩」关联回这条消息。
 // 官方约束：反馈只在「流式消息首次回复」时设置有效——多帧流式请挂在首帧（finish=false）。
-_ = client.Send(ctx, aibot.NewStreamReplyWithFeedback(msg.ReqID, streamID, "正在处理...", feedbackID, false))
-_ = client.Send(ctx, aibot.NewStreamReply(msg.ReqID, streamID, "处理完成", true)) // 覆盖帧无需再挂
+// 被动流式回复：反馈挂首帧（占位帧），覆盖终帧无需再挂
+_ = client.Send(ctx, aibot.WithFeedback(aibot.NewStreamReply(msg.ReqID, streamID, "正在处理...", false), feedbackID))
+_ = client.Send(ctx, aibot.NewStreamReply(msg.ReqID, streamID, "处理完成", true))
+
+// 主动 markdown 推送：同一个入口
+_ = client.Send(ctx, aibot.WithFeedback(aibot.NewMarkdownPush(chatID, aibot.ChatTypeGroup, "**任务完成**"), feedbackID))
 ```
 
 常驻运行建议：

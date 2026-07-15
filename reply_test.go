@@ -89,8 +89,8 @@ func TestStreamReplyBuildsIncrementalPayload(t *testing.T) {
 	}
 }
 
-func TestStreamReplyWithFeedbackAttachesFeedbackID(t *testing.T) {
-	reply := NewStreamReplyWithFeedback("req-1", "stream-1", "vinezing...", "fb-42", false)
+func TestWithFeedbackAttachesToStreamReply(t *testing.T) {
+	reply := WithFeedback(NewStreamReply("req-1", "stream-1", "vinezing...", false), "fb-42")
 
 	data, err := json.Marshal(reply)
 	if err != nil {
@@ -112,8 +112,55 @@ func TestStreamReplyWithFeedbackAttachesFeedbackID(t *testing.T) {
 	}
 }
 
-func TestStreamReplyWithEmptyFeedbackOmitsFeedback(t *testing.T) {
-	reply := NewStreamReplyWithFeedback("req-1", "stream-1", "hi", "", true)
+func TestWithFeedbackAttachesToMarkdownPush(t *testing.T) {
+	// 主动推送帧（PushMessage）——验证 WithFeedback 泛型入口同样覆盖主动回复路径。
+	push := WithFeedback(NewMarkdownPush("chat-1", ChatTypeGroup, "**done**"), "fb-9")
+
+	data, err := json.Marshal(push)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+
+	md := got["body"].(map[string]any)["markdown"].(map[string]any)
+	feedback, ok := md["feedback"].(map[string]any)
+	if !ok {
+		t.Fatalf("markdown.feedback missing, got %v", md)
+	}
+	if feedback["id"] != "fb-9" {
+		t.Fatalf("markdown.feedback.id = %v, want fb-9", feedback["id"])
+	}
+}
+
+func TestWithFeedbackAttachesToTemplateCardReply(t *testing.T) {
+	reply := WithFeedback(NewTemplateCardReply("req-1", TemplateCard{"card_type": "text_notice"}), "fb-7")
+
+	data, err := json.Marshal(reply)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+
+	card := got["body"].(map[string]any)["template_card"].(map[string]any)
+	feedback, ok := card["feedback"].(map[string]any)
+	if !ok {
+		t.Fatalf("template_card.feedback missing, got %v", card)
+	}
+	if feedback["id"] != "fb-7" {
+		t.Fatalf("template_card.feedback.id = %v, want fb-7", feedback["id"])
+	}
+}
+
+func TestWithFeedbackEmptyIDIsNoOp(t *testing.T) {
+	reply := WithFeedback(NewStreamReply("req-1", "stream-1", "hi", true), "")
 
 	data, err := json.Marshal(reply)
 	if err != nil {
@@ -127,7 +174,7 @@ func TestStreamReplyWithEmptyFeedbackOmitsFeedback(t *testing.T) {
 
 	stream := got["body"].(map[string]any)["stream"].(map[string]any)
 	if _, ok := stream["feedback"]; ok {
-		t.Fatalf("stream.feedback should be omitted when feedbackID empty")
+		t.Fatalf("stream.feedback should be omitted when id empty")
 	}
 }
 
