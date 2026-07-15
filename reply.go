@@ -50,11 +50,22 @@ type ReplyMessage = WsFrame[ReplyBody]
 // many optional layouts. Callers can pass the official JSON shape directly.
 type TemplateCard map[string]any
 
+// StreamFeedback 挂在流式回复上的反馈信息（对应官方 stream.feedback）。
+// 设置后企微会给这条回复渲染「准确/不准确」反馈按钮，用户点击后触发 feedback_event
+// 回调（详情见 FeedbackEvent），可用于复盘机器人回复效果。
+type StreamFeedback struct {
+	// ID 反馈 id，回调 feedback_event.id 会原样带回。有效长度 256 字节以内，须 utf-8。
+	// 约束（官方）：只在「流式消息首次回复」时设置有效——即多帧流式回复应挂在首帧上。
+	ID string `json:"id"`
+}
+
 // StreamMessageBody is the body of a stream reply.
 type StreamMessageBody struct {
 	ID      string `json:"id"`
 	Finish  bool   `json:"finish,omitempty"`
 	Content string `json:"content,omitempty"`
+	// Feedback 可选反馈信息，非空时该回复会带反馈按钮。见 StreamFeedback。
+	Feedback *StreamFeedback `json:"feedback,omitempty"`
 }
 
 // NewStreamReply creates a stream reply. requestID must come from
@@ -72,6 +83,19 @@ func NewStreamReply(requestID, streamID, content string, finish bool) ReplyMessa
 			},
 		},
 	}
+}
+
+// NewStreamReplyWithFeedback 与 NewStreamReply 相同，但额外挂上反馈 id，让这条回复带
+// 「准确/不准确」按钮。feedbackID 为空时等价于 NewStreamReply（不挂反馈）。
+//
+// 官方约束：反馈只在「流式消息首次回复」时设置有效，故多帧流式回复应把反馈挂在首帧
+// （finish=false 的占位帧），后续覆盖帧无需重复设置。
+func NewStreamReplyWithFeedback(requestID, streamID, content, feedbackID string, finish bool) ReplyMessage {
+	reply := NewStreamReply(requestID, streamID, content, finish)
+	if feedbackID != "" {
+		reply.Body.Stream.Feedback = &StreamFeedback{ID: feedbackID}
+	}
+	return reply
 }
 
 // NewTextReply creates a one-shot stream reply for ordinary text content.

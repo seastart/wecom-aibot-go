@@ -163,6 +163,15 @@ _ = err
 
 `SendAndWait` 会按 `headers.req_id` 串行发送并等待企微 ACK，适合流式多段回复。
 
+带反馈按钮的回复（收 `feedback_event` 的发送侧）：
+
+```go
+// feedbackID 会被回调 feedback_event.id 原样带回，用于把「用户点赞/点踩」关联回这条回复。
+// 官方约束：反馈只在「流式消息首次回复」时设置有效——多帧流式请挂在首帧（finish=false）。
+_ = client.Send(ctx, aibot.NewStreamReplyWithFeedback(msg.ReqID, streamID, "正在处理...", feedbackID, false))
+_ = client.Send(ctx, aibot.NewStreamReply(msg.ReqID, streamID, "处理完成", true)) // 覆盖帧无需再挂
+```
+
 常驻运行建议：
 
 ```go
@@ -268,7 +277,7 @@ _, _ = client.SendAndWait(ctx, mediaPush)
 
 > 官方文档：[事件回调](https://developer.work.weixin.qq.com/document/path/101027)、[长连接·接收事件回调](https://developer.work.weixin.qq.com/document/path/101463)
 
-事件的业务字段**嵌套在与 `eventtype` 同名的子对象里**，库已按官方 schema 建模：`template_card_event` 的详情在 `event.Event.TemplateCard`（含 `EventKey` / `TaskID` / `CardType` / `SelectedItems`），`feedback_event` 的详情在 `event.Event.Feedback`（含 `ID` / `Type` / `Content` / `InaccurateReasonList`）。
+事件的业务字段**嵌套在与 `eventtype` 同名的子对象里**，库已按官方 schema 建模：`template_card_event` 的详情在 `event.Event.TemplateCard`（含 `EventKey` / `TaskID` / `CardType` / `SelectedItems`），`feedback_event` 的详情在 `event.Event.Feedback`（含 `ID` / `Type` / `Content` / `InaccurateReasonList`）。其中 `feedback_event.id` 就是回复时经 `NewStreamReplyWithFeedback` 设置的 `stream.feedback.id`（发送侧见上文「带反馈按钮的回复」）——一发一收成对使用，即可把用户反馈关联回具体回复。
 
 ```go
 client.OnEvent(func(ctx context.Context, event *aibot.Event) error {

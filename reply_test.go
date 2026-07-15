@@ -89,6 +89,48 @@ func TestStreamReplyBuildsIncrementalPayload(t *testing.T) {
 	}
 }
 
+func TestStreamReplyWithFeedbackAttachesFeedbackID(t *testing.T) {
+	reply := NewStreamReplyWithFeedback("req-1", "stream-1", "vinezing...", "fb-42", false)
+
+	data, err := json.Marshal(reply)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+
+	stream := got["body"].(map[string]any)["stream"].(map[string]any)
+	feedback, ok := stream["feedback"].(map[string]any)
+	if !ok {
+		t.Fatalf("stream.feedback missing, got %v", stream)
+	}
+	if feedback["id"] != "fb-42" {
+		t.Fatalf("stream.feedback.id = %v, want fb-42", feedback["id"])
+	}
+}
+
+func TestStreamReplyWithEmptyFeedbackOmitsFeedback(t *testing.T) {
+	reply := NewStreamReplyWithFeedback("req-1", "stream-1", "hi", "", true)
+
+	data, err := json.Marshal(reply)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+
+	stream := got["body"].(map[string]any)["stream"].(map[string]any)
+	if _, ok := stream["feedback"]; ok {
+		t.Fatalf("stream.feedback should be omitted when feedbackID empty")
+	}
+}
+
 func TestPushMarkdownBuildsPushPayload(t *testing.T) {
 	push := NewMarkdownPush("chat-1", ChatTypeGroup, "**done**")
 
