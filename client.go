@@ -285,6 +285,14 @@ func (c *Client) Run(ctx context.Context) (retErr error) {
 
 	c.mu.Lock()
 	c.conn = conn
+	// missedPongCount 是「本条连接」的心跳健康度，必须随新连接归零。
+	// 第一性原理：它挂在 Client 上跨连接复用，而只在收到心跳 ACK 时才清零；
+	// 若上一条连接把它累加到 MaxMissedPong 后断开（如网络抖动/代理丢包），
+	// 新连接的心跳线程首个 tick 就会命中 `>= MaxMissedPong` 而立即 Close，
+	// 且这一刻还没来得及发心跳、更收不到 ACK 来清零 —— 于是每条新连接都在
+	// ~1 个心跳间隔内被自己掐死，RunForever 永远重连不上、进程不重启就出不来。
+	// 在建连处清零，保证每条连接都从「健康」起步。
+	c.missedPongCount = 0
 	c.mu.Unlock()
 	ctxDone := make(chan struct{})
 	go func() {

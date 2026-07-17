@@ -589,6 +589,80 @@ func TestClientRunFailsWhenSubscribeAckTimesOut(t *testing.T) {
 	}
 }
 
+// TestClientRunResetsMissedPongOnNewConnection 回归：新连接必须把 missedPongCount 归零。
+//
+// 事故场景（真机）：missedPongCount 挂在 Client 上跨连接复用，只在收到心跳 ACK 时清零。
+// 若上一条连接因丢包把它累加到 MaxMissedPong 后断开，进程不重启、Client 复用，则新连接的
+// 心跳线程首个 tick 就命中 `>= MaxMissedPong` 立即 Close，且这一刻还没发心跳、更收不到 ACK
+// 来清零——每条新连接都在一个心跳间隔内被自己掐死，RunForever 永远缓不过来。
+// 本测试预先把计数器污染成「超阈值」，验证建连后它已被重置为 0。
+func TestClientRunResetsMissedPongOnNewConnection(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade returned error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		var sub WsFrame[SubscribeBody]
+		if err := conn.ReadJSON(&sub); err != nil {
+			t.Errorf("ReadJSON subscribe returned error: %v", err)
+			return
+		}
+		// 回订阅 ACK → 客户端认定「真正连上」，此刻建连时的计数器重置必已执行。
+		if err := conn.WriteJSON(WsFrame[struct{}]{
+			Headers: WsHeaders{ReqID: sub.Headers.ReqID},
+			ErrCode: intPtr(0),
+			ErrMsg:  "ok",
+		}); err != nil {
+			t.Errorf("WriteJSON subscribe ack returned error: %v", err)
+			return
+		}
+		<-release
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client := NewClient(Config{
+		BotID:             "bot-1",
+		Secret:            "secret-1",
+		Endpoint:          wsURL,
+		HeartbeatInterval: time.Hour, // 心跳不触发，隔离出「建连重置」这一行为
+		ReplyAckTimeout:   time.Second,
+	})
+
+	// 污染计数器：模拟上一条连接遗留的「已达阈值」状态。必须在 Run 之前设置。
+	client.missedPongCount = client.cfg.MaxMissedPong + 5
+
+	connected := make(chan struct{}, 1)
+	client.OnConnectionState(func(state ConnState, _ error) {
+		if state == StateConnected {
+			connected <- struct{}{}
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = client.Run(ctx) }()
+
+	select {
+	case <-connected:
+	case <-ctx.Done():
+		t.Fatalf("timeout waiting for connected")
+	}
+
+	client.mu.Lock()
+	got := client.missedPongCount
+	client.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("建连后 missedPongCount = %d, want 0（新连接未重置遗留计数器，会在首个心跳 tick 自我掐死）", got)
+	}
+	close(release)
+}
+
 func intPtr(v int) *int {
 	return &v
 }
