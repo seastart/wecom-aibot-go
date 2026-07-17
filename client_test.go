@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -665,4 +667,118 @@ func TestClientRunResetsMissedPongOnNewConnection(t *testing.T) {
 
 func intPtr(v int) *int {
 	return &v
+}
+
+// attemptCaptureHandler 是一个极简 slog.Handler，只从「wecom 等待重连」日志里抓取 attempt 值，
+// 供测试观察退避计数的演进（库未把 attempt 暴露为字段，只能经日志外露）。
+type attemptCaptureHandler struct {
+	mu       *sync.Mutex
+	attempts *[]int64
+}
+
+func (h attemptCaptureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h attemptCaptureHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h attemptCaptureHandler) WithGroup(string) slog.Handler            { return h }
+func (h attemptCaptureHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != "wecom 等待重连" {
+		return nil
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "attempt" {
+			h.mu.Lock()
+			*h.attempts = append(*h.attempts, a.Value.Int64())
+			h.mu.Unlock()
+			return false
+		}
+		return true
+	})
+	return nil
+}
+
+// TestClientRunForeverResetsBackoffAfterSuccessfulConnect 回归：一次成功连上后，指数退避计数必须归零。
+//
+// 缺陷场景：attempt 在 RunForever 里单调递增、成功连上从不重置——它把「连续失败次数」错当成
+// 「进程生命周期内的总断开次数」。于是健康连接偶发抖动也会被历史累积的 attempt 拖到 30s 上限，
+// 越连越慢、最终永久钉死在封顶。本测试让服务端「失败两次 → 成功连上一次 → 再失败」，
+// 断言成功连上后那次的 attempt 回落到 1（而非继续递增到 3）。
+func TestClientRunForeverResetsBackoffAfterSuccessfulConnect(t *testing.T) {
+	var connIdx int64
+	var idxMu sync.Mutex
+
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		idxMu.Lock()
+		connIdx++
+		n := connIdx
+		idxMu.Unlock()
+
+		// 第 3 条连接：回订阅 ACK → 客户端认定「真正连上」（connectedThisRun=true），随后关连接。
+		// 其余连接：读掉订阅帧后直接关，不回 ACK → Run 在订阅前就断，从未连上。
+		var sub WsFrame[SubscribeBody]
+		_ = conn.ReadJSON(&sub)
+		if n == 3 {
+			_ = conn.WriteJSON(WsFrame[struct{}]{
+				Headers: WsHeaders{ReqID: sub.Headers.ReqID},
+				ErrCode: intPtr(0),
+				ErrMsg:  "ok",
+			})
+			time.Sleep(30 * time.Millisecond) // 留出时间让客户端读到 ACK、触发 Connected 边沿
+		}
+	}))
+	defer server.Close()
+
+	var mu sync.Mutex
+	var attempts []int64
+	logger := slog.New(attemptCaptureHandler{mu: &mu, attempts: &attempts})
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client := NewClient(Config{
+		BotID:             "bot-1",
+		Secret:            "secret-1",
+		Endpoint:          wsURL,
+		HeartbeatInterval: time.Hour,
+		ReconnectInterval: time.Millisecond, // 退避基数压到 1ms，测试无需真等 3s/6s
+		ReplyAckTimeout:   200 * time.Millisecond,
+		Logger:            logger,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = client.RunForever(ctx) }()
+
+	// 等到至少 4 条「等待重连」记录（覆盖 失败#1、失败#2、成功后#3、再失败#4）。
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(attempts)
+		mu.Unlock()
+		if n >= 4 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timeout：只收集到 %d 条重连记录，不足 4 条", n)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+
+	mu.Lock()
+	got := append([]int64(nil), attempts...)
+	mu.Unlock()
+
+	// 关键断言：第 3 条连接成功连上，故其后那次重连的 attempt 必须回落到 1。
+	// 若退避未重置，序列会是 1,2,3,4...（第 3 条会是 3）。
+	if got[0] != 1 || got[1] != 2 {
+		t.Fatalf("成功连上前的退避序列 = %v，期望以 1,2 递增", got[:2])
+	}
+	if got[2] != 1 {
+		t.Fatalf("成功连上后 attempt = %d，期望重置为 1（退避未在成功连接后归零，会越连越慢直至钉死 30s 上限）", got[2])
+	}
 }

@@ -102,6 +102,11 @@ type Client struct {
 	// connected 记录「上一次向调用方广播的连接状态」，用于把重连过程去抖成 Connected/Disconnected
 	// 两个真边沿：仅当此值发生翻转时才触发回调（见 transitionConn），避免退避重试期间反复误报。
 	connected bool
+	// connectedThisRun 标记「本轮 Run 是否成功连上过（订阅 ACK 通过）」。RunForever 每轮 Run 前清零，
+	// transitionConn(true) 置位；据此判断本次断开前连接是否真正建立过，从而决定退避计数是重置还是累加。
+	// 第一性原理：指数退避衡量的应是「连续失败次数」，一旦成功连上就该清零——否则健康连接偶尔抖一下也
+	// 会被历史累积的 attempt 拖到 30s 上限，越连越慢、进程生命周期内永久钉死在封顶。
+	connectedThisRun bool
 
 	writeMu sync.Mutex
 
@@ -179,6 +184,10 @@ func (c *Client) transitionConn(connected bool, cause error) {
 	c.mu.Lock()
 	changed := c.connected != connected
 	c.connected = connected
+	if connected {
+		// 记录本轮 Run 曾成功连上，供 RunForever 重置退避计数（不受掉线时置回 false 影响）。
+		c.connectedThisRun = true
+	}
 	c.mu.Unlock()
 	if !changed {
 		return
@@ -222,6 +231,10 @@ func (c *Client) RunForever(ctx context.Context) error {
 			return ctx.Err()
 		}
 
+		c.mu.Lock()
+		c.connectedThisRun = false
+		c.mu.Unlock()
+
 		err := c.Run(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -243,6 +256,15 @@ func (c *Client) RunForever(ctx context.Context) error {
 				return fmt.Errorf("%w: %v", ErrServerDisconnected, err)
 			}
 			return ErrServerDisconnected
+		}
+
+		// 本轮曾成功连上过 → 这是一次「健康连接的偶发掉线」，退避计数清零，从最小间隔重新退避；
+		// 从未连上（连拨号/订阅都没过）→ 累加 attempt，指数退避避免猛捶不可用的服务端。
+		c.mu.RLock()
+		connectedThisRun := c.connectedThisRun
+		c.mu.RUnlock()
+		if connectedThisRun {
+			attempt = 0
 		}
 
 		attempt++
