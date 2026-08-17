@@ -38,7 +38,10 @@ func TestUploadMediaUsesInitChunkFinishProtocol(t *testing.T) {
 				body = json.RawMessage(`{"upload_id":"upload-1"}`)
 			}
 			if frame.Cmd == WsCmdUploadMediaFinish {
-				body = json.RawMessage(`{"type":"image","media_id":"media-1","created_at":"now"}`)
+				// created_at 按【真机实际形态】返回裸数字：官方文档的响应示例把它写成带引号的
+				// 字符串，此前这里照文档写 mock，于是把「库声明成 string、真机返回数字」的解析
+				// 崩溃整整掩盖了过去（真机事故 2026-08-17）。mock 要照着服务端写，不是照着文档写。
+				body = json.RawMessage(`{"type":"image","media_id":"media-1","created_at":1380000000}`)
 			}
 			_ = conn.WriteJSON(WsFrame[json.RawMessage]{
 				Headers: frame.Headers,
@@ -77,6 +80,9 @@ func TestUploadMediaUsesInitChunkFinishProtocol(t *testing.T) {
 	}
 	if result.MediaID != "media-1" {
 		t.Fatalf("MediaID = %q, want media-1", result.MediaID)
+	}
+	if result.CreatedAt != 1380000000 {
+		t.Fatalf("CreatedAt = %d, want 1380000000", result.CreatedAt)
 	}
 	want := []string{WsCmdUploadMediaInit, WsCmdUploadMediaChunk, WsCmdUploadMediaFinish}
 	if len(cmds) != len(want) {

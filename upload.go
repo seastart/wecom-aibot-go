@@ -20,9 +20,12 @@ type UploadMediaOptions struct {
 
 // UploadMediaResult is returned by aibot_upload_media_finish.
 type UploadMediaResult struct {
-	Type      MessageType `json:"type"`
-	MediaID   string      `json:"media_id"`
-	CreatedAt string      `json:"created_at"`
+	Type    MessageType `json:"type"`
+	MediaID string      `json:"media_id"`
+	// CreatedAt 媒资上传时间戳。类型用宽松的 Timestamp 而非 string/int64——官方文档自相矛盾
+	// （响应示例写 "created_at": "1380000000" 带引号，字段说明表却写 int），真机返回的是**裸数字**。
+	// 见 Timestamp 的说明：这是个纯装饰字段，绝不该因为它的编码形态毁掉整个 ack 的解析。
+	CreatedAt Timestamp `json:"created_at"`
 }
 
 type uploadInitBody struct {
