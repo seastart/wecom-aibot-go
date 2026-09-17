@@ -1,9 +1,8 @@
 package aibot
 
 import (
+	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -22,37 +21,19 @@ type DownloadedFile struct {
 }
 
 // DecryptFile decrypts a WeCom encrypted media file with AES-256-CBC.
+//
+// 它与 OpenFile 的流式路径共用同一个解密器（decryptReader），**刻意不各写一份**：
+// 「CBC 分批解密 + 32 字节块 PKCS#7 去填充」这段逻辑一旦有两份实现，两者会各错各的，
+// 而那种故障的形态是「整份解得开、流式只有最后 32 字节错乱」——极难归因。
 func DecryptFile(encrypted []byte, aesKey string) ([]byte, error) {
 	if len(encrypted) == 0 {
 		return nil, errors.New("decrypt file: encrypted buffer is empty")
 	}
-	if aesKey == "" {
-		return nil, errors.New("decrypt file: aes key is empty")
-	}
-
-	key, err := decodeBase64Lenient(aesKey)
+	r, err := newDecryptReader(bytes.NewReader(encrypted), aesKey)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt file: decode aes key: %w", err)
+		return nil, err
 	}
-	if len(key) != 32 {
-		return nil, fmt.Errorf("decrypt file: aes key length = %d, want 32", len(key))
-	}
-	if len(encrypted)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("decrypt file: encrypted length %d is not AES block aligned", len(encrypted))
-	}
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt file: create AES cipher: %w", err)
-	}
-
-	decrypted := make([]byte, len(encrypted))
-	// 企业微信媒体解密算法与 Node SDK 一致：
-	// AES-256-CBC，IV 取 key 前 16 字节，然后手动移除 32 字节块 PKCS#7 padding。
-	mode := cipher.NewCBCDecrypter(block, key[:aes.BlockSize])
-	mode.CryptBlocks(decrypted, encrypted)
-
-	return pkcs7Unpad32(decrypted)
+	return io.ReadAll(r)
 }
 
 // decodeBase64Lenient decodes base64 the way Node's Buffer.from(s, "base64") does:
@@ -79,37 +60,24 @@ func DownloadFile(ctx context.Context, url string, aesKey string) (*DownloadedFi
 }
 
 // DownloadFileWithClient is DownloadFile with an injectable HTTP client for tests.
+//
+// 它是 OpenFileWithClient 的「整份读进内存」版本，保留给不在乎体积的小附件（图片、语音）。
+// 大文件请直接用 OpenFile/OpenFileWithClient：这里的 io.ReadAll 会让内存占用与文件大小同阶。
 func DownloadFileWithClient(ctx context.Context, client *http.Client, url string, aesKey string) (*DownloadedFile, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	stream, err := OpenFileWithClient(ctx, client, url, aesKey)
 	if err != nil {
 		return nil, err
 	}
+	defer stream.Close()
 
-	resp, err := client.Do(req)
+	body, err := io.ReadAll(stream)
 	if err != nil {
 		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("download file: HTTP %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if aesKey != "" {
-		body, err = DecryptFile(body, aesKey)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	return &DownloadedFile{
 		Buffer:   body,
-		Filename: filenameFromContentDisposition(resp.Header.Get("Content-Disposition")),
+		Filename: stream.Filename,
 	}, nil
 }
 
