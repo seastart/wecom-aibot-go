@@ -160,7 +160,11 @@ func (r *decryptReader) fill() {
 	if n > 0 {
 		data := append(r.carry, r.buf[:n]...)
 		usable := len(data) - len(data)%aes.BlockSize
-		r.carry = append(r.carry[:0], data[usable:]...)
+		// ★ 残余【必须等解密完再写回 carry】：carry 预分配到单轮上限、此后 append 从不扩容，
+		// 于是 data 与 carry 是【同一个底层数组】。先写回就等于把尾部那几个字节 copy 到
+		// data 的开头，把还没解密的密文当场覆盖掉——而长度一个字节没变、填充照样对得上，
+		// 故解密不报错、文件大小也对，只是每一轮开头的两个 AES 分组解出来是乱码。
+		// 症状因此是最坏的一种：静默的内容损坏（PNG 头被覆盖、图像数据流中途失步）。
 		if usable > 0 {
 			plain := r.plain[:usable]
 			r.mode.CryptBlocks(plain, data[:usable])
@@ -173,6 +177,7 @@ func (r *decryptReader) fill() {
 				r.hold = all
 			}
 		}
+		r.carry = append(r.carry[:0], data[usable:]...)
 	}
 
 	switch {

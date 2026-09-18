@@ -23,11 +23,17 @@ func TestDecryptReaderRoundTripAcrossReadShapes(t *testing.T) {
 	key := bytes.Repeat([]byte{7}, 32)
 	aesKey := base64.StdEncoding.EncodeToString(key)
 
-	lengths := []int{0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1024, decryptStreamChunk + 123}
+	lengths := []int{0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1024, decryptStreamChunk + 123, 3*decryptStreamChunk + 777}
 	shapes := map[string]func(io.Reader) io.Reader{
 		"plain":   func(r io.Reader) io.Reader { return r },
 		"oneByte": func(r io.Reader) io.Reader { return iotest.OneByteReader(r) },
 		"half":    func(r io.Reader) io.Reader { return iotest.HalfReader(r) },
+		// ★ 这一档是真机故障（#1850）逼出来的：上面三种【都测不出】carry 与 data 的
+		// 切片别名——plain/half 每次读回来的都是 16 的倍数（残余恒为 0），oneByte 则
+		// 攒够一组才解一次（残余同样恒为 0）。要让残余非零，必须一次读回【既大于一组、
+		// 又不是一组的整数倍】的量，而那正是真实网络（TLS record 边界）的常态。
+		"misaligned1000": func(r io.Reader) io.Reader { return chunkedReader{r: r, n: 1000} },
+		"misaligned4097": func(r io.Reader) io.Reader { return chunkedReader{r: r, n: 4097} },
 	}
 
 	for _, n := range lengths {
@@ -181,4 +187,18 @@ func TestOpenFileRejectsHTTPError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("应报 HTTP 403，实际: %v", err)
 	}
+}
+
+// chunkedReader 每次最多返回 n 字节，用来制造【不对齐 AES 分组】的读边界。
+// iotest 没有现成的等价物：OneByteReader 太小（攒不满一组）、HalfReader 恰好总是对齐。
+type chunkedReader struct {
+	r io.Reader
+	n int
+}
+
+func (c chunkedReader) Read(p []byte) (int, error) {
+	if len(p) > c.n {
+		p = p[:c.n]
+	}
+	return c.r.Read(p)
 }
