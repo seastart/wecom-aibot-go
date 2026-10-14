@@ -554,7 +554,10 @@ func (c *Client) heartbeatLoop(ctx context.Context, done <-chan struct{}) {
 func (c *Client) dispatchFrame(ctx context.Context, data []byte) error {
 	frame, err := ParseFrame(data)
 	if err != nil {
-		return err
+		// 解析失败只丢这一帧、不断连接：一条坏帧（真机：正文里带未转义控制字符）若断开重连，
+		// 服务端照样会把它丢弃或重推，换来的只是每条这样的消息都掐一次长连接。
+		c.cfg.Logger.Warn("wecom 收到无法解析的帧，已跳过", "err", err, "bytes", len(data))
+		return nil
 	}
 
 	switch frame.Kind {

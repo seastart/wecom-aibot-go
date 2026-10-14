@@ -249,7 +249,13 @@ func ParseFrame(data []byte) (*Frame, error) {
 		ErrMsg  string          `json:"errmsg"`
 	}
 	if err := json.Unmarshal(data, &ws); err != nil {
-		return nil, err
+		// 服务端会把用户正文里的控制字符原样塞进 JSON 字符串（见 escapeRawControlChars），
+		// 修补后重试一次；修补后仍不合法才是真坏帧。后续 Body/Raw 都基于修补后的字节。
+		fixed := escapeRawControlChars(data)
+		if err2 := json.Unmarshal(fixed, &ws); err2 != nil {
+			return nil, err
+		}
+		data = fixed
 	}
 
 	frame := &Frame{Kind: FrameKindUnknown, Raw: append(json.RawMessage(nil), data...)}
@@ -285,4 +291,34 @@ func ParseFrame(data []byte) (*Frame, error) {
 	}
 
 	return frame, nil
+}
+
+// escapeRawControlChars 把 JSON 字符串字面量内部的原始控制字符（< 0x20）转义成 \u00XX。
+//
+// 第一性原理：**用户发什么字符不由我们决定，一条消息的内容绝不能有权毁掉整条连接**。
+// 真机事故（2026-10-14）：用户在企微里粘贴了一段带 ANSI 颜色码的报错日志（`ESC[1;31m`），
+// 企微服务端下发 msg_callback 时把 ESC（0x1b）原样写进了 JSON 字符串、没有转义——这违反 JSON 规范，
+// encoding/json 报 `invalid character '\x1b' in string literal`。
+//
+// 只处理字符串内部：字符串外的 \t \n \r 是合法空白，不能动；字符串内已有的转义序列（`\"`、`\\`）
+// 要原样跳过，否则会错判字符串边界。合法 JSON 经过它字节不变，故只在首次解析失败时调用。
+func escapeRawControlChars(data []byte) []byte {
+	const hex = "0123456789abcdef"
+	out := make([]byte, 0, len(data)+16)
+	inString, escaped := false, false
+	for _, b := range data {
+		switch {
+		case escaped: // 上一字节是字符串内的反斜杠，本字节属于转义序列，原样保留
+			escaped = false
+		case inString && b == '\\':
+			escaped = true
+		case b == '"':
+			inString = !inString
+		case inString && b < 0x20:
+			out = append(out, '\\', 'u', '0', '0', hex[b>>4], hex[b&0xf])
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
 }

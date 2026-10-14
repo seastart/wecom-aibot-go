@@ -782,3 +782,11 @@ func TestClientRunForeverResetsBackoffAfterSuccessfulConnect(t *testing.T) {
 		t.Fatalf("成功连上后 attempt = %d，期望重置为 1（退避未在成功连接后归零，会越连越慢直至钉死 30s 上限）", got[2])
 	}
 }
+
+// 一条无法解析的帧只能被跳过，绝不能让读循环拿到 error 进而断开整条长连接。
+func TestDispatchFrameSkipsUnparsableFrame(t *testing.T) {
+	client := NewClient(Config{BotID: "bot-1", Secret: "secret-1"})
+	if err := client.dispatchFrame(context.Background(), []byte(`{"cmd":`)); err != nil {
+		t.Fatalf("dispatchFrame returned error: %v", err)
+	}
+}

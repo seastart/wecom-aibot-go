@@ -108,3 +108,28 @@ func TestParseFrameEventNestedFields(t *testing.T) {
 		}
 	})
 }
+
+// 真机事故（2026-10-14）：企微服务端把正文里的 ESC（ANSI 颜色码）原样写进 JSON 字符串，
+// 标准解析会失败。修补后必须能解出完整正文，且控制字符本身不丢。
+func TestParseFrameToleratesRawControlCharsInStrings(t *testing.T) {
+	data := []byte("{\"cmd\":\"aibot_msg_callback\",\"headers\":{\"req_id\":\"r1\"},\n\t\"body\":{\"msgtype\":\"text\",\"text\":{\"content\":\"err \x1b[1;31mboom\x1b[m\tq\\\"x\\\\\"}}}")
+	frame, err := ParseFrame(data)
+	if err != nil {
+		t.Fatalf("ParseFrame: %v", err)
+	}
+	if frame.Kind != FrameKindMessage || frame.Message.ReqID != "r1" {
+		t.Fatalf("unexpected frame: %+v", frame)
+	}
+	want := "err \x1b[1;31mboom\x1b[m\tq\"x\\"
+	if got := frame.Message.Text.Content; got != want {
+		t.Fatalf("content = %q, want %q", got, want)
+	}
+}
+
+// 合法 JSON 经过修补必须字节不变（包括字符串外的空白与字符串内的转义）。
+func TestEscapeRawControlCharsKeepsValidJSON(t *testing.T) {
+	valid := []byte("{\n\t\"a\": \"x\\\"\\n\\\\\",\r\n \"b\": [1, \"\\u001b\"]}")
+	if got := escapeRawControlChars(valid); string(got) != string(valid) {
+		t.Fatalf("valid JSON changed:\n%q\n%q", valid, got)
+	}
+}
