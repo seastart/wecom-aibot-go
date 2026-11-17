@@ -34,6 +34,14 @@ type Config struct {
 	ReplyAckTimeout time.Duration
 	// MaxMissedPong closes the connection after this many missed heartbeat ACKs.
 	MaxMissedPong int
+	// ReconnectOnServerDisconnect 为 true 时，收到 disconnected_event 后 RunForever 照常重连，
+	// 不再停止；默认 false（停止重连并返回 ErrServerDisconnected）。
+	//
+	// 第一性原理：这个事件按官方文档只表示「被同 BotID 的新连接顶替」，但真机上它也会在
+	// 断网/睡眠恢复的那一刻偶发下发（vinez 22 天日志里 2 次，均无第二个实例）。此时停止重连
+	// 就是让通道静默下线到进程重启。能确定「不会有第二个实例」的是调用方而不是库，
+	// 故是否永远重连交给调用方决定。代价：真有两个实例时双方会互相踢，每轮间隔为重连退避。
+	ReconnectOnServerDisconnect bool
 	// Logger 注入调用方的结构化日志器；为 nil 时库【完全静默】（内部回退到 slog.DiscardHandler）。
 	//
 	// 第一性原理：库是纯机制层，「打不打日志、打到哪、什么级别」是调用方的策略——库不应擅自写
@@ -612,6 +620,11 @@ func (c *Client) reconnectDelay(attempt int) time.Duration {
 
 func (c *Client) handleReconnectControlEvent(event *Event) {
 	if event == nil || event.Event == nil || event.Event.EventType != EventTypeDisconnected {
+		return
+	}
+	if c.cfg.ReconnectOnServerDisconnect {
+		// 调用方声明不会有第二个实例：照常重连，只留一行日志供排查。
+		c.cfg.Logger.Warn("wecom 收到 disconnected_event，按配置继续重连")
 		return
 	}
 	c.mu.Lock()

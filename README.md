@@ -84,6 +84,7 @@ if err := client.RunForever(context.Background()); err != nil {
 | `ReconnectInterval` | `RunForever` 首次重连间隔（之后指数退避，封顶 30s） | 3s |
 | `ReplyAckTimeout` | `SendAndWait` 等待企微 ACK 的超时 | 5s |
 | `MaxMissedPong` | 连续丢失多少次心跳 ACK 后判定连接失效并断开重连 | 3 |
+| `ReconnectOnServerDisconnect` | 收到 `disconnected_event` 后仍照常重连（见下方事件表的说明） | false |
 
 > 同一个机器人同一时间只能有一个有效长连接，多实例连同一个 BotID 会互相踢下线（见文末「重要限制」）。
 
@@ -313,6 +314,8 @@ client.OnEvent(func(ctx context.Context, event *aibot.Event) error {
 ```
 
 > ⚠️ 收到 `disconnected_event` 说明该机器人的长连接被另一个实例抢占了（同一机器人同时只能有一个有效长连接）。此时 `RunForever` 会**故意不再重连**。如果线上出现"机器人突然不回消息"，先排查是不是有多个实例在连同一个 BotID。
+>
+> ⚠️ 但这个事件**不只在被顶替时出现**：真机上断网/睡眠恢复的那一刻也偶发下发（没有任何第二个实例），默认行为会让机器人一直下线到进程重启。能确定只有一个实例的调用方，可设 `ReconnectOnServerDisconnect: true` 让它照常重连。
 
 ## 短连接示例
 

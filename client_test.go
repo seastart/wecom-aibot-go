@@ -790,3 +790,53 @@ func TestDispatchFrameSkipsUnparsableFrame(t *testing.T) {
 		t.Fatalf("dispatchFrame returned error: %v", err)
 	}
 }
+
+// TestClientRunForeverReconnectOnServerDisconnect 验证 ReconnectOnServerDisconnect=true 时，
+// 收到 disconnected_event 后 RunForever 照常重连、不返回 ErrServerDisconnected。
+func TestClientRunForeverReconnectOnServerDisconnect(t *testing.T) {
+	connections := make(chan struct{}, 8)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		connections <- struct{}{}
+		var sub WsFrame[SubscribeBody]
+		if err := conn.ReadJSON(&sub); err != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"cmd":"aibot_event_callback","headers":{"req_id":"evt-1"},"body":{"event":{"eventtype":"disconnected_event"}}}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		BotID:                       "bot-1",
+		Secret:                      "secret-1",
+		Endpoint:                    "ws" + strings.TrimPrefix(server.URL, "http"),
+		HeartbeatInterval:           time.Hour,
+		ReconnectInterval:           10 * time.Millisecond,
+		ReconnectOnServerDisconnect: true,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- client.RunForever(ctx) }()
+
+	// 收到 disconnected_event 后应发起第二条连接。
+	for i := 0; i < 2; i++ {
+		select {
+		case <-connections:
+		case err := <-errCh:
+			t.Fatalf("RunForever 提前返回：%v（第 %d 条连接前）", err, i+1)
+		case <-ctx.Done():
+			t.Fatalf("超时：只看到 %d 条连接，未重连", i)
+		}
+	}
+	cancel()
+	if err := <-errCh; errors.Is(err, ErrServerDisconnected) {
+		t.Fatalf("不应返回 ErrServerDisconnected：%v", err)
+	}
+}
